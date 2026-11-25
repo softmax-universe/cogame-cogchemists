@@ -85,20 +85,12 @@ proc sigName*(sig: int): string =
     result.add(if sigBit(sig, aspect) == 1: '+' else: '-')
 
 proc parseSignature*(text: string): int =
-  ## "R+G-B+", "+-+" and "+ - +" all parse to the same index; anything not
-  ## yielding exactly three signs is -1.
-  var normalized = text
-  for dash in ["\u2212", "\u2013", "\u2014"]:
-    normalized = normalized.replace(dash, "-")
-  var bits: seq[int]
-  for ch in normalized:
-    if ch == '+':
-      bits.add(1)
-    elif ch == '-':
-      bits.add(0)
-  if bits.len != 3:
-    return -1
-  bits[0] * 4 + bits[1] * 2 + bits[2]
+  ## Strict canonical signature: one of R+G+B+ .. R-G-B- in exact RGB order.
+  let trimmed = text.strip()
+  for sig in 0 ..< Signatures:
+    if trimmed == sigName(sig):
+      return sig
+  -1
 
 # ---- The mixing rule --------------------------------------------------------
 

@@ -54,6 +54,8 @@ type
     pending: seq[bool]
     accepted: seq[bool]
     actions: seq[Action]
+    lastRawInput: seq[string]
+    lastRejection: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -169,7 +171,7 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   for frame in replayMatch(config, events):
     result.add(frame.tableStateJson())
 
-proc finishEpisode(runtimeConfig: RuntimeConfig) =
+proc finishEpisode(runtimeConfig: RuntimeConfig, failurePayload: JsonNode = nil) =
   var results: JsonNode
   var replayData: string
   var grace = 20
@@ -206,6 +208,14 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     state.broadcastLocked()
 
   sleep(500)
+  if not failurePayload.isNil:
+    let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+    if failureUri.len > 0:
+      echo "cogchemists: writing player failure artifact"
+      writeArtifact(
+        failureUri, $failurePayload, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD"
+      )
   echo "cogchemists: writing results and replay"
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
@@ -221,6 +231,9 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "cogchemists: artifacts written; serving for ", grace,
     "s before shutdown"
   sleep(max(0, grace) * 1000)
+  if not failurePayload.isNil:
+    echo "cogchemists: episode failed explicitly, shutting down"
+    quit(1)
   echo "cogchemists: episode complete, shutting down"
   quit(0)
 
@@ -324,27 +337,32 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
       ## External players decide over the same phase snapshot as prompt and
       ## scripted seats. Send all observations before waiting for any reply.
-      var clientScripted = newSeq[ScriptKind](scripted.len)
-      for slot in 0 ..< scripted.len:
-        clientScripted[slot] = scripted[slot]
+      var nonExternalSeats: seq[int]
+      var isExternal = newSeq[bool](seats.len)
       withLock stateLock:
         inc state.decisionId
-        for seat in seats:
+        for index, seat in seats:
           if state.external[seat]:
-            clientScripted[seat] = skAssayer
+            isExternal[index] = true
             state.pending[seat] = true
             state.accepted[seat] = false
+            state.lastRawInput[seat] = ""
+            state.lastRejection[seat] = ""
             if state.playerSockets.hasKey(seat):
               state.playerSockets[seat].send($ %*{
                 "type": "observation", "id": state.decisionId,
                 "observation": simCopy.observationJson(seat)
               })
+          else:
+            nonExternalSeats.add(seat)
 
-      ## The prompt seats remain one parallel Claude batch. External players
-      ## are represented by a baseline until their own action arrives.
-      var fromScript: seq[bool]
-      var decisions = client.decideAll(simCopy, seats, prompts, clientScripted,
-        fromScript, state.selection)
+      ## Prompt and explicitly scripted seats run in one parallel batch.
+      ## External seats never receive a scripted fallback.
+      let nonExternalOutcomes =
+        if nonExternalSeats.len > 0:
+          client.decideAll(simCopy, nonExternalSeats, prompts, scripted, state.selection)
+        else:
+          @[]
 
       let deadline = epochTime() + config.llmTimeoutSeconds.float
       while epochTime() < deadline:
@@ -358,12 +376,64 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           break
         sleep(20)
 
+      var outcomes = newSeq[DecisionOutcome](seats.len)
+      var nonExtPos = 0
       withLock stateLock:
         for index, seat in seats:
-          if state.pending[seat] and state.accepted[seat]:
-            decisions[index] = state.actions[seat]
-            fromScript[index] = false
-          state.pending[seat] = false
+          if isExternal[index]:
+            if state.pending[seat] and state.accepted[seat]:
+              outcomes[index] = DecisionOutcome(
+                ok: true,
+                action: state.actions[seat],
+                fromScript: false,
+                rawReply: state.lastRawInput[seat]
+              )
+            else:
+              let err =
+                if state.lastRejection[seat].len > 0: state.lastRejection[seat]
+                else: "external player failed to submit a valid legal action"
+              outcomes[index] = DecisionOutcome(
+                ok: false,
+                fromScript: false,
+                error: err,
+                rawReply: state.lastRawInput[seat]
+              )
+            state.pending[seat] = false
+          else:
+            outcomes[index] = nonExternalOutcomes[nonExtPos]
+            inc nonExtPos
+
+      var failureList = newJArray()
+      for index, seat in seats:
+        if not outcomes[index].ok:
+          failureList.add(%*{
+            "slot": seat,
+            "name": config.players[seat].name,
+            "alias": simCopy.names[seat],
+            "error": outcomes[index].error,
+            "raw_response": outcomes[index].rawReply
+          })
+
+      if failureList.len > 0:
+        let failurePayload = %*{
+          "reason": "player_failure",
+          "round": simCopy.round,
+          "phase": $simCopy.phase,
+          "failures": failureList
+        }
+        withLock stateLock:
+          for index, seat in seats:
+            if not outcomes[index].ok and not state.trajectory.isNil:
+              let attempts =
+                if seat < client.nativeAttempts.len: client.nativeAttempts[seat]
+                else: @[]
+              state.trajectory.recordFailedDecision(config, state.selection,
+                simCopy.round * 2 + ord(simCopy.phase), seat, privateViews[index],
+                outcomes[index].error, outcomes[index].rawReply, attempts)
+          state.sim.failEpisode("player_failure")
+          state.broadcastLocked()
+        finishEpisode(runtimeConfig, failurePayload)
+        return
 
       withLock stateLock:
         for seat in order:
@@ -373,11 +443,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               position = index
           if position < 0:
             continue
-          let decision = decisions[position]
-          ## decideAll reports the fallback per seat, so a reply that failed
-          ## twice and took the scripted move is recorded scripted: true —
-          ## the same as a configured scripted seat or a disabled client.
-          let wasScripted = fromScript[position]
+          let outcome = outcomes[position]
+          let decision = outcome.action
+          let wasScripted = outcome.fromScript
           var engineRejected = false
           var resolutionReason = ""
           var applied = decision
@@ -388,7 +456,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               showAct(decision)
           except CogchemistsError as error:
             ## An earlier seat in this same phase undid the move. Recorded
-            ## as rejected and degraded to pass; the episode advances.
+            ## as rejected and degraded to pass per simultaneous-phase rules.
             echo "cogchemists: ", state.sim.names[seat], " rejected (",
               error.msg, "); passing"
             state.sim.applyRejection(seat, decision, error.msg, wasScripted)
@@ -396,10 +464,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             resolutionReason = error.msg
             applied = newAction("pass", say = applied.say, notes = applied.notes)
           if not state.trajectory.isNil:
+            let attempts =
+              if seat < client.nativeAttempts.len: client.nativeAttempts[seat]
+              else: @[]
             state.trajectory.recordAppliedDecision(config, state.selection,
               simCopy.round * 2 + ord(simCopy.phase), seat, privateViews[position],
               applied.actionReply(), wasScripted, engineRejected, resolutionReason,
-              client.nativeAttempts[seat])
+              attempts)
         state.broadcastLocked()
 
       if config.turnDelayMs > 0:
@@ -543,10 +614,11 @@ proc websocketHandler(
             prompt = prompt.runeSubStr(0, MaxPromptLen)
           let node = payload{"scripted"}
           let scripted =
-            if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skAssayer
-              else: skNone)
-            else: parseScriptKind(node.getStr())
+            if node.isNil or node.kind == JNull: skNone
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else:
+              raise newException(CogchemistsError,
+                "scripted must be a string (\"assayer\", \"quack\", or \"\")")
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
@@ -564,9 +636,11 @@ proc websocketHandler(
         elif payload{"type"}.getStr() == "action":
           let id = payload["id"].getInt()
           let move = payload["move"].getStr()
+          var rejectReason = ""
           withLock stateLock:
             if state.external[slot] and state.pending[slot] and
                 state.decisionId == id and not state.accepted[slot]:
+              state.lastRawInput[slot] = message.data
               for action in state.sim.legalActs(slot):
                 if showAct(action) == move:
                   state.actions[slot] = action
@@ -574,6 +648,16 @@ proc websocketHandler(
                   state.actions[slot].notes = payload{"notes"}.getStr()
                   state.accepted[slot] = true
                   break
+              if not state.accepted[slot]:
+                rejectReason = "illegal move: " & move
+                state.lastRejection[slot] = rejectReason
+          if rejectReason.len > 0:
+            websocket.send($ %*{
+              "type": "rejected",
+              "id": id,
+              "reason": rejectReason,
+              "move": move
+            })
       except CatchableError as error:
         echo "cogchemists: ignoring bad player frame: ", error.msg
     of ErrorEvent:
@@ -656,6 +740,8 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.pending = newSeq[bool](config.players.len)
   state.accepted = newSeq[bool](config.players.len)
   state.actions = newSeq[Action](config.players.len)
+  state.lastRawInput = newSeq[string](config.players.len)
+  state.lastRejection = newSeq[string](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)

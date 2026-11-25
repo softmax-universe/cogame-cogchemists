@@ -80,12 +80,25 @@ for game in ("standard", "silent-academy"):
                         request(process, {"kind": "teacher"})["response"]
                     )
                     action["notes"] = f"PRIVATE-{seat}"
+                    if len(trace) == 0:
+                        rejected = request(
+                            process,
+                            {
+                                "kind": "step",
+                                "decision_id": obs["decision_id"],
+                                "response": "Here is my move: " + json.dumps(action),
+                            },
+                        )
+                        assert rejected["kind"] == "rejected"
+                        raw_response = "```json\n" + json.dumps(action) + "\n```"
+                    else:
+                        raw_response = json.dumps(action)
                     response = request(
                         process,
                         {
                             "kind": "step",
                             "decision_id": obs["decision_id"],
-                            "response": json.dumps(action),
+                            "response": raw_response,
                         },
                     )
                     assert (

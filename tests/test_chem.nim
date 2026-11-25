@@ -102,12 +102,12 @@ suite "signature notation":
       seen.incl(name)
     check seen.len == Signatures
 
-  test "R+G-B+, +-+ and + - + parse to the same index":
+  test "non-canonical signature aliases are rejected":
     let expected = parseSignature("R+G-B+")
     check expected >= 0
-    check parseSignature("+-+") == expected
-    check parseSignature("+ - +") == expected
-    check parseSignature("r+g-b+") == expected
+    check parseSignature("  R+G-B+  ") == expected
+    for alias in ["+-+", "+ - +", "r+g-b+", "B+G-R+", "R+G\u2212B+"]:
+      check parseSignature(alias) == -1
 
   test "malformed signatures are -1":
     for bad in ["R+G-", "+++-", "", "RGB", "R+G-B+X+"]:

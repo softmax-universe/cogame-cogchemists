@@ -53,14 +53,15 @@ coworld upload-policy coworld-cogchemists:latest \
 `PLAYER_SCRIPTED=assayer` fields the built-in competent scientist instead (picks the experiment
 whose worst case leaves the fewest chemistries standing, publishes only what it has solved, attacks
 only with a reagent that must expose the claim); `PLAYER_SCRIPTED=quack` fields the reckless
-careerist. Both also play **every** seat when no LLM credentials are present, so offline
-certification and the docker smoke always complete without a network call.
+careerist. Offline certification and the docker smoke explicitly select these baseline policies so
+they complete without a network call; prompt seats require LLM credentials and fail explicitly on
+missing credentials or invalid replies rather than substituting a scripted fallback.
 
 For real-model posttraining, enable the private native decision trajectory with
 `COGAME_SAVE_TRAJECTORY_URI`. It preserves the actual parallel requests, retries,
-received responses and applied actions without changing play. Scripted fallbacks,
-normalized replies and proposals rejected during initiative resolution are not
-real-model training targets. See [the capture workflow](docs/TRAINING.md).
+received responses and applied actions without changing play. Failed replies end the episode
+explicitly with raw responses preserved; normalized replies and proposals rejected during
+initiative resolution are not real-model training targets. See [the capture workflow](docs/TRAINING.md).
 
 ## Layout
 

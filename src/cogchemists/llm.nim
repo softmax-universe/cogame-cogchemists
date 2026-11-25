@@ -6,18 +6,16 @@
 ## Decisions inside a phase are simultaneous BY RULE, so all four seats'
 ## requests go out as ONE parallel batch (curly.makeRequests) — 12 batches
 ## in a default 6-round episode, never 48 sequential calls. Invalid replies
-## are retried once as a smaller batch carrying an "your previous reply was
-## invalid" hint; anything still failing takes the scripted `assayer` move.
+## are retried once as a smaller batch carrying the rejection reason; a seat
+## that still fails returns an explicit failure (never a scripted fallback).
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits, no spacing
-## floor) so offline certification still completes — this fallback is
-## load-bearing. The same scripted bots are also fieldable policies.
+## Explicitly scripted seats (PLAYER_SCRIPTED=assayer|quack) play without LLM
+## credentials; prompt seats require credentials and fail explicitly without.
 
 import
   std/[json, options, os, random, strutils, times, unicode],
@@ -38,6 +36,13 @@ type
     skNone = "none"
     skAssayer = "assayer"
     skQuack = "quack"
+
+  DecisionOutcome* = object
+    ok*: bool
+    action*: Action
+    fromScript*: bool
+    error*: string
+    rawReply*: string
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -60,12 +65,15 @@ type
     disabled*: bool   ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"assayer" play the competent
-  ## scientist, "quack" the reckless careerist, anything else nothing.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "assayer", "scientist": skAssayer
-  of "quack", "careerist": skQuack
-  else: skNone
+  ## Canonical PLAYER_SCRIPTED values: "" (prompt player), "assayer", "quack".
+  let trimmed = text.strip()
+  case trimmed
+  of "": skNone
+  of "assayer": skAssayer
+  of "quack": skQuack
+  else:
+    raise newException(CogchemistsError,
+      "unknown scripted baseline: \"" & trimmed & "\" (expected \"assayer\", \"quack\", or empty)")
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -149,10 +157,9 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    ## No credentials: no network wait, no spacing floor, every seat
-    ## scripted. Offline certification and the docker smoke depend on it.
+    ## No credentials: no spacing floor; only explicitly scripted seats may play.
     result.minBatchSpacingMs = 0
-    echo "cogchemists llm: no LLM credentials; using scripted fallback"
+    echo "cogchemists llm: no LLM credentials configured (only explicit scripted seats may play)"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -309,45 +316,21 @@ proc cleanText*(text: string, limit: int): string =
     return
   result = result.runeSubStr(0, limit - 1) & "…"
 
-proc normalizeName(text: string): string =
-  for ch in text.toLowerAscii():
-    if ch in {'a' .. 'z'}:
-      result.add(ch)
-
 proc resolveIngredient*(text: string): int =
-  ## A full name (case-insensitive), a unique prefix of at least three
-  ## letters, or the index 0-7.
+  ## Exact canonical ingredient name from IngredientNames.
   let trimmed = text.strip()
-  if trimmed.len == 0:
-    return -1
-  var digits = true
-  for ch in trimmed:
-    if ch notin {'0' .. '9'}:
-      digits = false
-  if digits:
-    let index = parseInt(trimmed)
-    return (if index >= 0 and index < Ingredients: index else: -1)
-  let needle = normalizeName(trimmed)
-  if needle.len == 0:
-    return -1
   for index in 0 ..< Ingredients:
-    if normalizeName(IngredientNames[index]) == needle:
+    if IngredientNames[index] == trimmed:
       return index
-  if needle.len < 3:
-    return -1
-  var hit = -1
-  for index in 0 ..< Ingredients:
-    if normalizeName(IngredientNames[index]).startsWith(needle):
-      if hit >= 0:
-        return -1     ## ambiguous prefix
-      hit = index
-  hit
+  -1
 
-proc normalizeVerb(text: string): string =
-  result = text.strip().toLowerAscii()
-  result = result.replace("-", "_").replace(" ", "_")
-  while "__" in result:
-    result = result.replace("__", "_")
+proc optionalStringField(payload: JsonNode, key: string): string =
+  if not payload.hasKey(key) or payload[key].kind == JNull:
+    return ""
+  if payload[key].kind != JString:
+    raise newException(CogchemistsError,
+      "\"" & key & "\" must be a string")
+  payload[key].getStr()
 
 proc actionReply*(action: Action): JsonNode =
   %*{"action": action.action,
@@ -358,15 +341,18 @@ proc actionReply*(action: Action): JsonNode =
 
 proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Action =
   ## Turns one model reply into an Action. Raises CogchemistsError on
-  ## anything the schema cannot read; the caller retries once and then
-  ## falls back to the scripted move.
+  ## anything outside the strict canonical schema.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(CogchemistsError, "response must be a JSON object")
   result.a = -1
   result.b = -1
   result.signature = -1
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"say"}.getStr(), MaxSayLen)
+  result.notes = cleanText(optionalStringField(payload, "notes"), MaxNotesLen)
+  result.say = cleanText(optionalStringField(payload, "say"), MaxSayLen)
     .replace("\n", " ").replace("\r", " ")
-  let verb = normalizeVerb(cleanText(payload{"action"}.getStr(), MaxActionLen))
+  if not payload.hasKey("action") or payload["action"].kind != JString:
+    raise newException(CogchemistsError, "no action in response")
+  let verb = payload["action"].getStr().strip()
   if verb.len == 0:
     raise newException(CogchemistsError, "no action in response")
   let menu = if sim.phase == phLab: @LabActions else: @MarketActions
@@ -374,31 +360,30 @@ proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Action =
     raise newException(CogchemistsError,
       "\"" & verb & "\" is not a " & $sim.phase & " action")
   result.action = verb
-  let aText = cleanText(payload{"a"}.getStr(), MaxActionLen)
-  let bText = cleanText(payload{"b"}.getStr(), MaxActionLen)
+  let aText = optionalStringField(payload, "a").strip()
+  let bText = optionalStringField(payload, "b").strip()
   if verb in ["test_student", "test_self", "sell", "transmute", "publish",
       "endorse", "debunk"]:
     result.a = resolveIngredient(aText)
     if result.a < 0:
       raise newException(CogchemistsError,
-        "\"" & aText & "\" is not one of the eight ingredients")
+        "\"" & aText & "\" is not one of the eight exact ingredient names")
   if verb in ["test_student", "test_self", "sell", "debunk"]:
     result.b = resolveIngredient(bText)
     if result.b < 0:
       raise newException(CogchemistsError,
-        "\"" & bText & "\" is not one of the eight ingredients")
+        "\"" & bText & "\" is not one of the eight exact ingredient names")
   if verb == "publish":
-    result.signature =
-      parseSignature(cleanText(payload{"signature"}.getStr(), MaxSignatureLen))
+    let sigText = optionalStringField(payload, "signature").strip()
+    result.signature = parseSignature(sigText)
     if result.signature < 0:
       raise newException(CogchemistsError,
-        "a signature is three signs in RGB order, like R+G-B+")
+        "signature must be exact RGB notation like R+G-B+")
   if verb == "buy":
-    result.artifact =
-      cleanText(payload{"artifact"}.getStr(), MaxArtifactLen).toLowerAscii()
+    result.artifact = optionalStringField(payload, "artifact").strip()
     if result.artifact notin ["mortar", "press"]:
       raise newException(CogchemistsError,
-        "the artifacts are \"mortar\" and \"press\"")
+        "artifact must be exact \"mortar\" or \"press\"")
 
 # ---- Prompt building --------------------------------------------------------
 
@@ -644,12 +629,19 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
     moves.add("  " & move)
   result.add("LEGAL MOVES (exactly these; anything else is rejected):\n" &
     moves.join("\n") & "\n\n")
-  result.add("Reply with ONLY a JSON object like " &
-    "{\"action\":\"publish\",\"a\":\"Nightcap\",\"b\":\"\"," &
-    "\"signature\":\"R+G-B+\",\"artifact\":\"\"" &
-    (if sim.config.talk: ",\"say\":\"…\"" else: "") &
-    ",\"notes\":\"…\"} — copy one of the LEGAL MOVES above into the " &
-    "action/a/b/signature/artifact fields" &
+  let talkField = if sim.config.talk: ",\"say\":\"\"" else: ""
+  let example =
+    if sim.phase == phLab:
+      "{\"action\":\"test_student\",\"a\":\"Nightcap\",\"b\":\"Sunmoss\"" &
+        talkField & ",\"notes\":\"\"} (or {\"action\":\"forage\"" &
+        talkField & ",\"notes\":\"\"})"
+    else:
+      "{\"action\":\"publish\",\"a\":\"Nightcap\",\"signature\":\"R+G-B+\"" &
+        talkField & ",\"notes\":\"\"} (or {\"action\":\"pass\"" &
+        talkField & ",\"notes\":\"\"})"
+  result.add("Reply with ONLY one JSON object, e.g. " & example &
+    " — copy one of the LEGAL MOVES above using exact action, ingredient, " &
+    "signature, and artifact names (unused fields may be omitted or \"\")" &
     (if sim.config.talk: "; say is a public remark of at most " &
       $MaxSayLen & " characters (or \"\")" else: "") &
     "; notes is your private notebook, at most " & $MaxNotesLen &
@@ -658,16 +650,37 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating
-  ## fences and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quoted into the log, so it is cut on a RUNE boundary like every
-    ## other captured string: a byte cut can leave invalid UTF-8 on stdout.
-    raise newException(CogchemistsError, "no JSON object in response: " &
+  ## Parses a raw JSON object or a single standard outer Markdown JSON fence
+  ## (```json ... ``` or ``` ... ```). Rejects surrounding prose.
+  var body = text.strip()
+  if body.startsWith("```"):
+    let nl = body.find('\n')
+    if nl < 0:
+      raise newException(CogchemistsError, "malformed markdown fence in response: " &
+        cleanText(text, 160).replace("\n", " "))
+    let header = body[3 ..< nl].strip().toLowerAscii()
+    if header.len > 0 and header != "json":
+      raise newException(CogchemistsError, "unsupported markdown fence in response: " &
+        cleanText(text, 160).replace("\n", " "))
+    if not body.endsWith("```"):
+      raise newException(CogchemistsError, "unterminated markdown fence in response: " &
+        cleanText(text, 160).replace("\n", " "))
+    let closing = body.len - 3
+    if closing <= nl + 1:
+      raise newException(CogchemistsError, "empty markdown fence in response: " &
+        cleanText(text, 160).replace("\n", " "))
+    body = body[nl + 1 ..< closing].strip()
+  if not (body.startsWith("{") and body.endsWith("}")):
+    raise newException(CogchemistsError, "response must be a JSON object: " &
       cleanText(text, 160).replace("\n", " "))
-  parseJson(text[start .. stop])
+  try:
+    result = parseJson(body)
+  except JsonParsingError as error:
+    raise newException(CogchemistsError, "invalid JSON in response (" & error.msg & "): " &
+      cleanText(text, 160).replace("\n", " "))
+  if result.kind != JObject:
+    raise newException(CogchemistsError, "JSON response must be an object: " &
+      cleanText(text, 160).replace("\n", " "))
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -751,33 +764,41 @@ proc decideAll*(
   seats: seq[int],
   prompts: seq[string],
   scripted: seq[ScriptKind],
-  fromScript: var seq[bool],
   selection: PromptSelection
-): seq[Action] =
-  ## One decision per seat in `seats`, in order, as ONE parallel batch.
-  ## Never raises: any failure falls back to the scripted baseline so the
-  ## episode always advances. `prompts` and `scripted` are indexed by SEAT.
-  ##
-  ## `fromScript` is indexed like the result (by POSITION in `seats`) and is
-  ## true wherever the returned action came from the baseline rather than a
-  ## model reply: a configured scripted seat, a disabled client, AND a seat
-  ## that fell back after its retry. The caller records exactly this flag,
-  ## so a fallback is never recorded as a real decision.
+): seq[DecisionOutcome] =
+  ## One decision outcome per seat in `seats`, in order, as ONE parallel batch.
+  ## Explicitly scripted seats use their chosen baseline. Prompt seats query
+  ## the LLM (with one retry on invalid reply) and return `ok = false` with
+  ## the error and preserved raw reply on failure — never a scripted fallback.
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
-  result = newSeq[Action](seats.len)
-  fromScript = newSeq[bool](seats.len)
+  result = newSeq[DecisionOutcome](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
+  var lastError = newSeq[string](seats.len)
+  var lastRaw = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skAssayer else: kind))
-      fromScript[index] = true
+    if kind != skNone:
+      result[index] = DecisionOutcome(
+        ok: true,
+        action: scriptedAction(sim, seat, kind),
+        fromScript: true
+      )
+    elif client.disabled:
+      result[index] = DecisionOutcome(
+        ok: false,
+        fromScript: false,
+        error: "no LLM credentials configured for prompt seat"
+      )
     else:
       open.add(index)
   for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
+    if open.len == 0:
+      break
+    if client.disabled:
+      for index in open:
+        if lastError[index].len == 0:
+          lastError[index] = "LLM client disabled after auth failure"
       break
     var batch: RequestBatch
     var pendingEvidence: seq[DecisionAttempt]
@@ -785,8 +806,8 @@ proc decideAll*(
       let seat = seats[index]
       var user = sim.userPrompt(seat, prompts[seat])
       if attempt > 0:
-        user.add("\n\nYour previous reply was invalid. Respond with ONLY " &
-          "the requested JSON object, copying one line of LEGAL MOVES.")
+        user.add("\n\nYour previous reply was rejected (" & lastError[index] &
+          "). Respond with ONLY the requested JSON object, copying one line of LEGAL MOVES.")
       let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
       if capture:
         pendingEvidence.add(nativeAttempt(sim.config.players[seat].name,
@@ -801,16 +822,18 @@ proc decideAll*(
       let seat = seats[index]
       var evidence: DecisionAttempt
       if capture: evidence = pendingEvidence[position]
+      var rawText = responses[position].response.body
       try:
         if capture:
           evidence.receiveNativeResponse(responses[position].response,
             responses[position].error, latencyMs)
         let text = client.textOf(responses[position].response,
           responses[position].error, batch[position].url)
+        rawText = text
         let payload = extractJsonObject(text)
         let action = parseReply(sim, seat, payload)
         ## Reject moves the rules refuse HERE, so the retry carries the
-        ## hint instead of the episode taking a silent fallback.
+        ## exact rejection reason.
         var probe = sim
         probe.applyAct(seat, action, false)
         if capture:
@@ -821,9 +844,16 @@ proc decideAll*(
             payload{"notes"}.getStr() == applied.notes
           if not evidence.accepted:
             evidence.rejectionReason = some("native parser normalized speech or notebook")
-        result[index] = action
+        result[index] = DecisionOutcome(
+          ok: true,
+          action: action,
+          fromScript: false,
+          rawReply: text
+        )
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
+        lastError[index] = error.msg
+        lastRaw[index] = rawText
         echo "cogchemists llm: seat ", seat, " attempt ", attempt,
           " failed: ", error.msg
         stillOpen.add(index)
@@ -831,6 +861,10 @@ proc decideAll*(
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "cogchemists llm: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedAction(sim, seat, skAssayer)
-    fromScript[index] = true
+    echo "cogchemists llm: seat ", seat, " failed explicitly: ", lastError[index]
+    result[index] = DecisionOutcome(
+      ok: false,
+      fromScript: false,
+      error: (if lastError[index].len > 0: lastError[index] else: "model decision failed"),
+      rawReply: lastRaw[index]
+    )
