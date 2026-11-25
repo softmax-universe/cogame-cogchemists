@@ -17,6 +17,7 @@ from pathlib import Path
 
 class Provider(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    fail_round_2 = False
 
     def log_message(self, *args):
         pass
@@ -33,8 +34,8 @@ class Provider(BaseHTTPRequestHandler):
         for other in range(4):
             if str(other) != slot:
                 assert "PRIVATE_OPERATOR_" + str(other) not in user
-        retry = "Your previous reply was invalid" in user
-        if phase == "LAB" and (round_number == 2 or (round_number == 1 and not retry)):
+        retry = "Your previous reply was rejected" in user
+        if phase == "LAB" and ((self.fail_round_2 and round_number == 2) or (round_number == 1 and not retry)):
             text = "invalid fixture reply"
         else:
             action = {"action": "forage" if phase == "LAB" else "pass", "say": "", "notes": "PRIVATE_CAPTURE_" + slot}
@@ -43,6 +44,8 @@ class Provider(BaseHTTPRequestHandler):
             if phase == "MARKET" and round_number == 1:
                 action.update(action="publish", a="Nightcap", signature="R+G+B+")
             text = json.dumps(action)
+            if phase == "LAB" and round_number == 1 and retry:
+                text = "```json\n" + text + "\n```"
         response = json.dumps(
             {
                 "model": body["model"],
@@ -59,8 +62,9 @@ class Provider(BaseHTTPRequestHandler):
         self.wfile.write(response)
 
 
-def run(game, player, output, variant, capture):
-    root = output / f"{variant['id']}-capture{capture}"
+def run(game, player, output, variant, capture, fail_round_2=False):
+    suffix = f"{variant['id']}-capture{capture}" + ("-fail" if fail_round_2 else "")
+    root = output / suffix
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
     seats = config["num_agents"]
@@ -94,6 +98,7 @@ def run(game, player, output, variant, capture):
         COGAME_CONFIG_URI=(root / "config.json").as_uri(),
         COGAME_RESULTS_URI=(root / "results.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(root / "replay.json").as_uri(),
+        COGAME_PLAYER_FAILURE_URI=(root / "player_failure.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(root / "trajectory.jsonl").as_uri(),
         COWORLD_EPISODE_ID=episode,
         COWORLD_GAME_VERSION="identity-fixture",
@@ -101,7 +106,12 @@ def run(game, player, output, variant, capture):
     )
     if not capture:
         env.pop("COGAME_SAVE_TRAJECTORY_URI")
-    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+
+    class CaseProvider(Provider):
+        pass
+
+    CaseProvider.fail_round_2 = fail_round_2
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), CaseProvider)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{provider.server_port}"
@@ -129,11 +139,34 @@ def run(game, player, output, variant, capture):
             player_env = dict(env, PLAYER_PROMPT=f"PRIVATE_OPERATOR_{seat}", COWORLD_TIMEOUT_SECONDS="120")
             player_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={seat}&token=fixture-{seat}"
             children.append(subprocess.Popen([str(player)], env=player_env, stdout=log, stderr=subprocess.STDOUT))
-        assert server.wait(timeout=120) == 0
+        rc = server.wait(timeout=120)
         for child in children[1:]:
             assert child.wait(timeout=5) == 0
         results = json.loads((root / "results.json").read_text())
         replay = json.loads((root / "replay.json").read_text())
+        if fail_round_2:
+            assert rc != 0
+            assert results["reason"] == "player_failure"
+            failure = json.loads((root / "player_failure.json").read_text())
+            assert failure["reason"] == "player_failure"
+            assert len(failure["failures"]) == seats
+            for entry in failure["failures"]:
+                assert entry["raw_response"] == "invalid fixture reply"
+            if capture:
+                trace = root / "trajectory.jsonl"
+                rows = [json.loads(line) for line in trace.read_text().splitlines()]
+                assert rows[-1]["status"] == "failed"
+                failed_rows = [r for r in rows[:-1] if r["terminal"]]
+                assert len(failed_rows) == seats
+                for row in failed_rows:
+                    assert row["action_status"] == "rejected"
+                    assert row["executed_action"] is None
+                    assert row["selected_attempt_id"] is None
+                    assert len(row["attempts"]) == 2
+                    assert all(a["response"] == "invalid fixture reply" for a in row["attempts"])
+            return results, replay
+        assert rc == 0
+        assert not (root / "player_failure.json").exists()
         assert results["reason"] == "complete"
         assert results["rounds"] == config["rounds"]
         if capture:
@@ -153,9 +186,6 @@ def run(game, player, output, variant, capture):
                     assert len(attempts) == 2 and not attempts[0]["accepted"]
                     assert attempts[1]["accepted"]
                     assert row["selected_attempt_id"] == attempts[1]["attempt_id"]
-                elif round_number == 2 and phase == "lab":
-                    assert row["action_status"] == "fallback"
-                    assert row["selected_attempt_id"] is None and len(attempts) == 2
                 elif round_number == 3 and phase == "lab":
                     assert row["action_status"] == "rejected"
                     assert row["selected_attempt_id"] is None
@@ -198,9 +228,10 @@ def main():
         captured = run(game, player, destination, variant, True)
         ordinary = run(game, player, destination, variant, False)
         assert captured == ordinary, "capture changed the native outcome or replay"
+    run(game, player, destination, manifest["variants"][0], True, fail_round_2=True)
     print(
-        "four complete native games: capture parity, initiative-conflict exclusion, retries, fallback, "
-        "normalization, privacy and missing usage pass"
+        "five native games: capture parity, initiative-conflict exclusion, retries, explicit failure "
+        "(no fallback), normalization, privacy and missing usage pass"
     )
 
 

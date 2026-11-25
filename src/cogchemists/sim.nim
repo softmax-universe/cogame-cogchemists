@@ -773,6 +773,13 @@ proc endEarly*(sim: var Sim) =
     sim.runExhibition()
   sim.settle("deadline")
 
+proc failEpisode*(sim: var Sim, reason = "player_failure") =
+  ## Ends the episode with an explicit failure without synthesizing actions
+  ## or holding an unearned exhibition.
+  if sim.done:
+    return
+  sim.settle(reason)
+
 # ---- Results ----------------------------------------------------------------
 
 proc resultsJson*(sim: Sim): JsonNode =
@@ -1216,7 +1223,8 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[Sim] =
     of evEnd:
       if not sim.done:
         ## A deadline stop is not derivable from the acts alone.
-        if not sim.exhibited:
+        let endReason = if event.text.len > 0: event.text else: "complete"
+        if not sim.exhibited and endReason != "player_failure":
           sim.runExhibition()
-        sim.settle(if event.text.len > 0: event.text else: "complete")
+        sim.settle(endReason)
     result.add(sim)

@@ -12,8 +12,9 @@ received response bodies, retries, private phase-opening observations and final
 applied actions. All seats still infer in the same parallel batch and resolve
 in the original initiative order. A proposal legal at phase opening can lose
 to an earlier seat: its proposed response is retained, its applied action is
-recorded as a pass, and the decision is rejected for training. Scripted
-fallbacks and speech/notebook normalization are also excluded. Unavailable
+recorded as a pass, and the decision is rejected for training. Failed model
+replies end the episode explicitly with raw responses preserved (never a
+scripted fallback), and speech/notebook normalization is excluded. Unavailable
 usage, tokenizer identities and token likelihoods remain unknown.
 
 Use the research package's `collect-hosted`, `prepare-hosted-data` and SLIME

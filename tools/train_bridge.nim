@@ -131,14 +131,19 @@ proc encode(): JsonNode =
 proc step(command: JsonNode): JsonNode =
   if command["decision_id"].getInt() != decisionId:
     return %*{"kind": "rejected", "reason": "stale decision"}
-  let action = parseJson(command["response"].getStr())
+  var action: JsonNode
   if languageMode:
-    let proposal = parseReply(game, seat, action)
-    let rejection = game.checkAct(seat, proposal)
-    if rejection.len > 0:
-      return %*{"kind": "rejected", "reason": rejection}
-    proposals[seat] = proposal
+    try:
+      action = extractJsonObject(command["response"].getStr())
+      let proposal = parseReply(game, seat, action)
+      let rejection = game.checkAct(seat, proposal)
+      if rejection.len > 0:
+        return %*{"kind": "rejected", "reason": rejection}
+      proposals[seat] = proposal
+    except CatchableError as error:
+      return %*{"kind": "rejected", "reason": error.msg}
   else:
+    action = parseJson(command["response"].getStr())
     let choice = action["choice"].getInt()
     doAssert choice in 0 .. 2
     choices[seat] = choice

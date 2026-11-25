@@ -3,7 +3,7 @@
 ## Prompt and scripted policies register with the game, then idle until the
 ## final frame.
 ##
-## PLAYER_SCRIPTED=assayer (or 1) registers the seat as the built-in
+## PLAYER_SCRIPTED=assayer registers the seat as the built-in
 ## competent scientist instead; PLAYER_SCRIPTED=quack as the reckless
 ## careerist. The server plays those deterministically, no LLM.
 ##

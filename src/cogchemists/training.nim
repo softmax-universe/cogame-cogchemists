@@ -61,10 +61,9 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
   var attempts = evidence
   var selected = none(string)
   var status = asAccepted
-  var fallback = none(string)
   if attempts.len == 0:
-    var attempt = newDecisionAttempt($phaseIndex & "-" & $seat & "-unknown",
-      config.players[seat].name, aoUnknown)
+    var attempt = newDecisionAttempt($phaseIndex & "-" & $seat & "-scripted",
+      config.players[seat].name, if scripted: aoTeacher else: aoUnknown)
     attempt.parsedAction = action
     attempt.accepted = not engineRejected
     attempts.add(attempt)
@@ -74,10 +73,6 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
       if attempt.accepted:
         attempt.accepted = false
         attempt.rejectionReason = some("initiative resolution: " & resolutionReason)
-  elif scripted and evidence.len > 0:
-    status = asFallback
-    fallback = some("engine-assayer")
-    for attempt in attempts.mitems: attempt.accepted = false
   elif evidence.len > 0:
     doAssert attempts[^1].parsedAction == action
     if attempts[^1].accepted: selected = some(attempts[^1].attemptId)
@@ -95,13 +90,45 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
           attempt.request["system"].getStr(),
           attempt.request["messages"][0]["content"].getStr())})
   trajectory.recordDecision($phaseIndex & "-" & $seat, $seat, view,
-    attempts, selected, action, status, fallbackOrigin = fallback)
+    attempts, selected, action, status)
+
+proc recordFailedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
+    selection: PromptSelection, phaseIndex, seat: int, observation: JsonNode,
+    reason, rawReply: string, evidence: seq[DecisionAttempt]) =
+  if trajectory.isNil: return
+  var attempts = evidence
+  let status = if evidence.len > 0 or rawReply.len > 0: asRejected else: asMissing
+  if attempts.len == 0:
+    var attempt = newDecisionAttempt($phaseIndex & "-" & $seat & "-failed",
+      config.players[seat].name, aoModel)
+    if rawReply.len > 0:
+      attempt.rawResponse = %rawReply
+      attempt.response = %rawReply
+    attempt.accepted = false
+    attempt.rejectionReason = some(reason)
+    attempts.add(attempt)
+  var view = copy(observation)
+  view["prompt_selection"] = selection.selectionMetadata()
+  view["prompt_attempts"] = newJArray()
+  view["resolution"] = %*{"rejected": true, "reason": reason}
+  for attempt in attempts:
+    if attempt.origin == aoModel and attempt.request.kind == JObject:
+      view["prompt_attempts"].add(%*{"attempt_id": attempt.attemptId,
+        "prompt_template": selection.promptMetadata(
+          attempt.request["system"].getStr(),
+          attempt.request["messages"][0]["content"].getStr())})
+  trajectory.recordDecision($phaseIndex & "-" & $seat, $seat, view,
+    attempts, none(string), newJNull(), status, terminal = true)
 
 proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   if trajectory.isNil: return
   let outcome = game.resultsJson()
   var scores = newJObject()
   for seat in 0 ..< Seats: scores[$seat] = outcome["scores"][seat]
-  trajectory.finish(if outcome["reason"].getStr() == "complete": esCompleted else: esTruncated,
-    outcome, scores)
+  let reason = outcome["reason"].getStr()
+  let status =
+    if reason == "complete": esCompleted
+    elif reason == "player_failure": esFailed
+    else: esTruncated
+  trajectory.finish(status, outcome, scores)
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))

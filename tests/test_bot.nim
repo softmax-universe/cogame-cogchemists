@@ -130,51 +130,70 @@ suite "baseline behaviour":
         " vs quack mean ", meanScore(quacks)
       check meanScore(assayers) > meanScore(quacks)
 
-suite "the no-credentials fallback":
-  test "a disabled client decides scripted with no network wait":
-    ## The environment of a CI runner has no credentials, which is exactly
-    ## the offline-certification path this asserts.
+suite "explicit baselines and explicit failure (no implicit fallback)":
+  test "explicitly scripted seats complete with no network wait":
+    for envVar in ["COWORLD_LLM_ENDPOINT", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK"]:
+      delEnv(envVar)
     var config = fixture(3)
     config.minBatchSpacingMs = 10_000
     let client = newLlmClient(config)
     check client.disabled
-    ## The spacing floor is skipped entirely when the client is disabled.
     check client.minBatchSpacingMs == 0
     var sim = initSim(config)
     sim.drive()
     let started = getMonoTime()
+    let scripted = @[skAssayer, skQuack, skAssayer, skQuack]
     while not sim.done:
       let seats = sim.pendingSeats()
       check seats.len == Seats
-      var fromScript: seq[bool]
-      let decisions = client.decideAll(sim, seats,
-        newSeq[string](Seats), newSeq[ScriptKind](Seats), fromScript, PromptSelection())
-      check decisions.len == Seats
-      ## Every one of those actions came from the baseline, and decideAll
-      ## says so per seat, so the recorded event cannot claim otherwise.
-      check fromScript == @[true, true, true, true]
+      let outcomes = client.decideAll(sim, seats,
+        newSeq[string](Seats), scripted, PromptSelection())
+      check outcomes.len == Seats
+      for outcome in outcomes:
+        check outcome.ok
+        check outcome.fromScript
       for seat in initiativeOrder(sim.round):
         var position = -1
         for index, candidate in seats:
           if candidate == seat:
             position = index
-        sim.applyAct(seat, decisions[position], fromScript[position])
+        try:
+          sim.applyAct(seat, outcomes[position].action, outcomes[position].fromScript)
+        except CogchemistsError as error:
+          sim.applyRejection(seat, outcomes[position].action, error.msg,
+            outcomes[position].fromScript)
       sim.drive()
     let elapsed = (getMonoTime() - started).inMilliseconds
-    echo "  disabled 6-round episode: ", elapsed, " ms"
+    echo "  explicitly scripted 6-round episode: ", elapsed, " ms"
     check sim.reason == "complete"
     check elapsed < DisabledBudgetMs
-    ## The recording half: every act in the log is marked scripted.
     for event in sim.events:
       if event.kind == evAct:
         check event.scripted
 
-  test "a seat whose reply fails twice is recorded as scripted":
-    ## The live-credentials path: the client is NOT disabled and no seat is
-    ## configured scripted, so every seat goes out on the wire. The endpoint
-    ## refuses the connection, both attempts fail, and each seat takes the
-    ## assayer move — which decideAll must report as a fallback so phase 60
-    ## can tell a real decision from a scripted one.
+  test "a prompt seat without LLM credentials fails explicitly without fallback":
+    for envVar in ["COWORLD_LLM_ENDPOINT", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK"]:
+      delEnv(envVar)
+    var config = fixture(3)
+    let client = newLlmClient(config)
+    check client.disabled
+    var sim = initSim(config)
+    sim.drive()
+    let seats = sim.pendingSeats()
+    let outcomes = client.decideAll(sim, seats,
+      newSeq[string](Seats), @[skNone, skAssayer, skNone, skQuack], PromptSelection())
+    check outcomes.len == Seats
+    check not outcomes[0].ok
+    check not outcomes[0].fromScript
+    check "no LLM credentials" in outcomes[0].error
+    check outcomes[1].ok and outcomes[1].fromScript
+    check not outcomes[2].ok
+    check not outcomes[2].fromScript
+    check outcomes[3].ok and outcomes[3].fromScript
+
+  test "a seat whose reply fails twice fails explicitly without scripted fallback":
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:1")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-real-token")
     var config = fixture(4)
@@ -186,21 +205,21 @@ suite "the no-credentials fallback":
     var sim = initSim(config)
     sim.drive()
     let seats = sim.pendingSeats()
-    var fromScript: seq[bool]
-    let decisions = client.decideAll(sim, seats,
-      newSeq[string](Seats), newSeq[ScriptKind](Seats), fromScript, PromptSelection())
-    check decisions.len == Seats
-    check fromScript == @[true, true, true, true]
-    for seat in initiativeOrder(sim.round):
-      var position = -1
-      for index, candidate in seats:
-        if candidate == seat:
-          position = index
-      check showAct(decisions[position]) in sim.legalMoves(seat)
-      sim.applyAct(seat, decisions[position], fromScript[position])
-    for event in sim.events:
-      if event.kind == evAct:
-        check event.scripted
+    let outcomes = client.decideAll(sim, seats,
+      newSeq[string](Seats), newSeq[ScriptKind](Seats), PromptSelection())
+    check outcomes.len == Seats
+    for outcome in outcomes:
+      check not outcome.ok
+      check not outcome.fromScript
+      check outcome.error.len > 0
+
+  test "parseScriptKind accepts only canonical values and rejects aliases":
+    check parseScriptKind("") == skNone
+    check parseScriptKind("assayer") == skAssayer
+    check parseScriptKind("quack") == skQuack
+    for alias in ["1", "true", "yes", "scientist", "careerist", "ASSAYER", "bogus"]:
+      expect CogchemistsError:
+        discard parseScriptKind(alias)
 
 suite "reply parsing":
   test "the documented shapes parse and the caps hold":
@@ -216,20 +235,17 @@ suite "reply parsing":
     check action.b == 6
     check action.say == "a hunch"
     check sim.checkAct(0, action) == ""
+    ## Unused fields may be omitted.
+    let minimal = parseReply(sim, 0, parseJson("""{"action":"forage"}"""))
+    check minimal.action == "forage"
+    check sim.checkAct(0, minimal) == ""
 
-  test "ingredient prefixes, indices and case variants all resolve":
-    check resolveIngredient("Nightcap") == 0
-    check resolveIngredient("nightcap") == 0
-    check resolveIngredient("NIGHT") == 0
-    check resolveIngredient("0") == 0
-    check resolveIngredient("7") == 7
-    check resolveIngredient("Rime") == 7
-    check resolveIngredient("widows salt") == 3
-    check resolveIngredient("wid") == 3
-    ## Ambiguous and unknown both fail closed.
-    check resolveIngredient("xyzzy") == -1
-    check resolveIngredient("8") == -1
-    check resolveIngredient("") == -1
+  test "exact canonical ingredient names resolve and aliases are rejected":
+    for index, name in IngredientNames:
+      check resolveIngredient(name) == index
+    check resolveIngredient("  Nightcap  ") == 0
+    for alias in ["nightcap", "NIGHT", "0", "7", "Rime", "widows salt", "wid", "xyzzy", "8", ""]:
+      check resolveIngredient(alias) == -1
 
   test "every free-text field is capped on rune boundaries":
     var sim = initSim(fixture(6))
@@ -247,30 +263,44 @@ suite "reply parsing":
     check action.notes.validateUtf8() == -1
     check cleanText("a".repeat(100), MaxActionLen).runeLen == MaxActionLen
 
-  test "wrong-phase, unresolvable, malformed and unaffordable are invalid":
+  test "wrong-phase, aliases, unresolvable, malformed and unaffordable are invalid":
     var sim = initSim(fixture(7))
     sim.drive()
     check sim.phase == phLab
+    ## Prompt example matches LAB phase, not MARKET.
+    let labPrompt = sim.userPrompt(0, "")
+    check "\"action\":\"test_student\"" in labPrompt
+    check "\"action\":\"publish\"" notin labPrompt
     ## A market action in the lab phase.
     expect CogchemistsError:
       discard parseReply(sim, 0, %*{"action": "publish", "a": "Nightcap",
         "signature": "R+G-B+"})
+    ## Hyphenated, spaced, and uppercased verb aliases are rejected.
+    for badVerb in ["test-student", "test student", "TEST_STUDENT", "Pass"]:
+      expect CogchemistsError:
+        discard parseReply(sim, 0, %*{"action": badVerb, "a": "Nightcap", "b": "Sunmoss"})
     ## An ingredient that does not resolve.
     expect CogchemistsError:
       discard parseReply(sim, 0, %*{"action": "transmute", "a": "Moonjuice"})
+    expect CogchemistsError:
+      discard parseReply(sim, 0, %*{"action": "transmute", "a": "0"})
     ## No action at all.
     expect CogchemistsError:
       discard parseReply(sim, 0, %*{"say": "hello"})
-    ## A malformed signature, in the phase where publish is legal.
+    ## A malformed or non-canonical signature, in the phase where publish is legal.
     for seat in initiativeOrder(sim.round):
       sim.applyAct(seat, newAction("pass"), true)
     sim.drive()
     check sim.phase == phMarket
-    expect CogchemistsError:
-      discard parseReply(sim, 0, %*{"action": "publish", "a": "Nightcap",
-        "signature": "R+G-"})
-    expect CogchemistsError:
-      discard parseReply(sim, 0, %*{"action": "buy", "artifact": "telescope"})
+    let marketPrompt = sim.userPrompt(0, "")
+    check "\"action\":\"publish\"" in marketPrompt
+    for badSig in ["R+G-", "+-+", "r+g-b+", "B+G-R+"]:
+      expect CogchemistsError:
+        discard parseReply(sim, 0, %*{"action": "publish", "a": "Nightcap",
+          "signature": badSig})
+    for badArt in ["telescope", "MORTAR", "Press"]:
+      expect CogchemistsError:
+        discard parseReply(sim, 0, %*{"action": "buy", "artifact": badArt})
     ## Unaffordable: the schema reads it, and the RULES refuse it — which is
     ## what decideAll probes with before accepting a reply.
     sim.seats[0].coin = 0
@@ -278,13 +308,22 @@ suite "reply parsing":
       "signature": "R+G-B+"})
     check sim.checkAct(0, broke) == "no_coin"
 
-  test "trailing prose after the JSON object is tolerated":
-    let text = "```json\n{\"action\":\"pass\",\"notes\":\"ok\"}\n```\n" &
-      "I hope that helps!"
-    let node = extractJsonObject(text)
-    check node["action"].getStr() == "pass"
-    expect CogchemistsError:
-      discard extractJsonObject("I am afraid I cannot do that.")
+  test "raw JSON and outer markdown JSON fences parse; surrounding prose is rejected":
+    let raw = """{"action":"pass","notes":"ok"}"""
+    check extractJsonObject(raw)["action"].getStr() == "pass"
+    let fencedJson = "```json\n{\"action\":\"pass\",\"notes\":\"ok\"}\n```"
+    check extractJsonObject(fencedJson)["action"].getStr() == "pass"
+    let fencedPlain = "```\n{\"action\":\"forage\"}\n```"
+    check extractJsonObject(fencedPlain)["action"].getStr() == "forage"
+    for bad in [
+      "```json\n{\"action\":\"pass\"}\n```\nI hope that helps!",
+      "Here is my move:\n{\"action\":\"pass\"}",
+      "{\"action\":\"pass\"} trailing text",
+      "I am afraid I cannot do that.",
+      "[1, 2, 3]"
+    ]:
+      expect CogchemistsError:
+        discard extractJsonObject(bad)
 
   test "error text quoted into the log is cut on a rune boundary":
     ## The reply itself never reaches the replay, but it does reach stdout,
