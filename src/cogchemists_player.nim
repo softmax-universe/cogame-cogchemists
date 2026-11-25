@@ -79,6 +79,10 @@ when isMainModule:
         of "final":
           echo "cogchemists player: final scores ", payload{"scores"}
           break
+        of "error":
+          echo "cogchemists player: episode aborted (",
+            payload{"failure_kind"}.getStr(payload{"reason"}.getStr()), ")"
+          break
         else:
           discard
       except CatchableError as error:

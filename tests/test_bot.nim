@@ -187,10 +187,12 @@ suite "explicit baselines and explicit failure (no implicit fallback)":
     check outcomes.len == Seats
     check not outcomes[0].ok
     check not outcomes[0].fromScript
+    check outcomes[0].failureKind == fkMissingCredentials
     check "no LLM credentials" in outcomes[0].error
     check outcomes[1].ok and outcomes[1].fromScript
     check not outcomes[2].ok
     check not outcomes[2].fromScript
+    check outcomes[2].failureKind == fkMissingCredentials
     check outcomes[3].ok and outcomes[3].fromScript
 
   test "a seat whose reply fails twice fails explicitly without scripted fallback":
@@ -211,6 +213,7 @@ suite "explicit baselines and explicit failure (no implicit fallback)":
     for outcome in outcomes:
       check not outcome.ok
       check not outcome.fromScript
+      check outcome.failureKind == fkTransportFailure
       check outcome.error.len > 0
 
   test "parseScriptKind accepts only canonical values and rejects aliases":

@@ -171,7 +171,7 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   for frame in replayMatch(config, events):
     result.add(frame.tableStateJson())
 
-proc finishEpisode(runtimeConfig: RuntimeConfig, failurePayload: JsonNode = nil) =
+proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
   var grace = 20
@@ -208,14 +208,6 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, failurePayload: JsonNode = nil)
     state.broadcastLocked()
 
   sleep(500)
-  if not failurePayload.isNil:
-    let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
-    if failureUri.len > 0:
-      echo "cogchemists: writing player failure artifact"
-      writeArtifact(
-        failureUri, $failurePayload, "application/json",
-        "COGAME_PLAYER_FAILURE_METHOD"
-      )
   echo "cogchemists: writing results and replay"
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
@@ -231,11 +223,40 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, failurePayload: JsonNode = nil)
   echo "cogchemists: artifacts written; serving for ", grace,
     "s before shutdown"
   sleep(max(0, grace) * 1000)
-  if not failurePayload.isNil:
-    echo "cogchemists: episode failed explicitly, shutting down"
-    quit(1)
   echo "cogchemists: episode complete, shutting down"
   quit(0)
+
+proc abortEpisodeWithFailure(runtimeConfig: RuntimeConfig, failurePayload: JsonNode) =
+  ## Unscored explicit termination on exhausted model or transport failure.
+  ## Never settles the sim, never sends final.scores, and never writes
+  ## resultsUri or replayUri; emits only raw failure evidence and exits 1.
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    state.trajectory.failNativeTrajectory(failurePayload)
+    let errorFrame = $ %*{
+      "type": "error",
+      "done": true,
+      "reason": failurePayload["reason"],
+      "failure_kind": failurePayload["failure_kind"],
+      "failures": failurePayload["failures"]
+    }
+    for _, socket in state.playerSockets:
+      socket.send(errorFrame)
+    for socket in state.globalSockets:
+      socket.send(errorFrame)
+
+  sleep(500)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    echo "cogchemists: writing player failure artifact"
+    writeArtifact(
+      failureUri, $failurePayload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
+  echo "cogchemists: episode aborted unscored (", failurePayload["failure_kind"].getStr(), ")"
+  quit(1)
 
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
@@ -389,12 +410,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 rawReply: state.lastRawInput[seat]
               )
             else:
+              let hadRejection = state.lastRejection[seat].len > 0
               let err =
-                if state.lastRejection[seat].len > 0: state.lastRejection[seat]
+                if hadRejection: state.lastRejection[seat]
                 else: "external player failed to submit a valid legal action"
               outcomes[index] = DecisionOutcome(
                 ok: false,
                 fromScript: false,
+                failureKind: (if hadRejection: fkMalformedPlayerData else: fkExternalTimeout),
                 error: err,
                 rawReply: state.lastRawInput[seat]
               )
@@ -404,19 +427,27 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             inc nonExtPos
 
       var failureList = newJArray()
+      var primaryKind = fkNone
       for index, seat in seats:
         if not outcomes[index].ok:
+          let kind =
+            if outcomes[index].failureKind != fkNone: outcomes[index].failureKind
+            else: fkMalformedPlayerData
+          if primaryKind == fkNone or kind == fkTransportFailure:
+            primaryKind = kind
           failureList.add(%*{
             "slot": seat,
             "name": config.players[seat].name,
             "alias": simCopy.names[seat],
+            "failure_kind": $kind,
             "error": outcomes[index].error,
             "raw_response": outcomes[index].rawReply
           })
 
       if failureList.len > 0:
         let failurePayload = %*{
-          "reason": "player_failure",
+          "reason": $primaryKind,
+          "failure_kind": $primaryKind,
           "round": simCopy.round,
           "phase": $simCopy.phase,
           "failures": failureList
@@ -430,9 +461,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               state.trajectory.recordFailedDecision(config, state.selection,
                 simCopy.round * 2 + ord(simCopy.phase), seat, privateViews[index],
                 outcomes[index].error, outcomes[index].rawReply, attempts)
-          state.sim.failEpisode("player_failure")
-          state.broadcastLocked()
-        finishEpisode(runtimeConfig, failurePayload)
+        abortEpisodeWithFailure(runtimeConfig, failurePayload)
         return
 
       withLock stateLock:
