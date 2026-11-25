@@ -323,30 +323,10 @@
   },
   "player": [
     {
-      "id": "cogchemists-player",
-      "name": "Cogchemists Prompt Player",
-      "type": "player",
-      "description": "The reference prompt player delivers PLAYER_PROMPT to the game. The same player image supports PLAYER_SCRIPTED=assayer|quack. External players receive their seat-local state and complete legal move list, then return an exact move label; the game owns legality, results, and replay.",
-      "image": "{{COGCHEMISTS_IMAGE}}",
-      "run": [
-        "/bin/cogchemists-player"
-      ],
-      "resources": {
-        "requests": {
-          "cpu": "100m",
-          "memory": "64Mi"
-        },
-        "limits": {
-          "cpu": "1"
-        }
-      },
-      "source_url": "https://github.com/Metta-AI/cogame-cogchemists/tree/main"
-    },
-    {
       "id": "cogchemists-assayer",
       "name": "Cogchemists Assayer Baseline",
       "type": "player",
-      "description": "The scripted competent scientist as a fieldable policy: picks the experiment whose worst case leaves the fewest chemistries standing, publishes only ingredients its grid has SOLVED, and attacks a rival's seal only with a reagent whose demonstration must expose it. The game server plays it deterministically, no LLM involved.",
+      "description": "The scripted competent scientist as a fieldable policy: picks the experiment whose worst case leaves the fewest chemistries standing, publishes only ingredients its grid has SOLVED, and attacks a rival's seal only with a reagent whose demonstration must expose it. The game server plays it deterministically, no LLM involved. Prompt policies reuse the same image with /bin/cogchemists-player and PLAYER_PROMPT.",
       "image": "{{COGCHEMISTS_IMAGE}}",
       "run": [
         "/bin/cogchemists-player"
