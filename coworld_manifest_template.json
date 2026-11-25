@@ -38,7 +38,16 @@
       "properties": {
         "promptVariant": {
           "type": "string",
-          "enum": ["canonical", "plain", "numbered", "questions", "reordered", "heldout-briefing", "heldout-reference", "mixed"],
+          "enum": [
+            "canonical",
+            "plain",
+            "numbered",
+            "questions",
+            "reordered",
+            "heldout-briefing",
+            "heldout-reference",
+            "mixed"
+          ],
           "default": "canonical",
           "description": "Episode-stable rule wording; held-out variants are evaluation-only."
         },
@@ -291,7 +300,7 @@
     "docs": {
       "readme": {
         "type": "text",
-        "value": "Cogchemists is a port of the deduction half of Alchemists for four LLM-piloted cogs. Each episode the server draws a secret bijection from eight ingredients to eight alchemical signatures - triples of signs over RED, GREEN and BLUE, written R+G-B+ - out of the 40,320 possible, fresh from the seed, so nothing carries between episodes. Over six rounds of lab-then-market, seats forage, mix pairs of ingredients (privately on a paid student, or on themselves, where a negative potion poisons them and everyone sees them retch), sell potions to an adventurer who asked for a specific result, PUBLISH wax-sealed theories about single ingredients for immediate reputation and per-round royalties, endorse rivals' seals, and DEBUNK them by public demonstration - which burns a false seal only when the attacker brings a reagent that must expose it, and costs the attacker two reputation when it does not. The exhibition after the last round opens every standing seal against the truth: +5 reputation for a true theory, -6 for a false one. score = reputation + 0.2 x coin, higher is better, and a seat that published three lies finishes below zero. The player image supports prompt policies (PLAYER_PROMPT) and explicitly selected scripted baselines (PLAYER_SCRIPTED=assayer|quack). Prompt seats require LLM credentials and fail explicitly rather than falling back to a scripted policy; offline certification explicitly selects the assayer and quack baselines."
+        "value": "Cogchemists is a port of the deduction half of Alchemists for four LLM-piloted cogs. Each episode the server draws a secret bijection from eight ingredients to eight alchemical signatures - triples of signs over RED, GREEN and BLUE, written R+G-B+ - out of the 40,320 possible, fresh from the seed, so nothing carries between episodes. Over six rounds of lab-then-market, seats forage, mix pairs of ingredients (privately on a paid student, or on themselves, where a negative potion poisons them and everyone sees them retch), sell potions to an adventurer who asked for a specific result, PUBLISH wax-sealed theories about single ingredients for immediate reputation and per-round royalties, endorse rivals' seals, and DEBUNK them by public demonstration - which burns a false seal only when the attacker brings a reagent that must expose it, and costs the attacker two reputation when it does not. The exhibition after the last round opens every standing seal against the truth: +5 reputation for a true theory, -6 for a false one. score = reputation + 0.2 x coin, higher is better, and a seat that published three lies finishes below zero. The player image supports prompt policies (PLAYER_PROMPT, with game-owned LLM calls to COWORLD_LLM_ENDPOINT) and explicitly selected scripted baselines (PLAYER_SCRIPTED=assayer|quack). Prompt seats require LLM credentials and abort unscored on missing credentials, transport failure, or malformed replies rather than falling back to a scripted policy; certification seats cogchemists-player (COWORLD_LLM_ENABLED=true) against cogchemists-assayer and cogchemists-quack."
       },
       "pages": [
         {
@@ -340,13 +349,17 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cogchemists/tree/main"
+      "source_url": "https://github.com/Metta-AI/cogame-cogchemists/tree/main",
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      }
     },
     {
       "id": "cogchemists-assayer",
       "name": "Cogchemists Assayer Baseline",
       "type": "player",
-      "description": "The scripted competent scientist as a fieldable policy: picks the experiment whose worst case leaves the fewest chemistries standing, publishes only ingredients its grid has SOLVED, and attacks a rival's seal only with a reagent whose demonstration must expose it. The game server plays it deterministically, no LLM involved.",
+      "description": "The scripted competent scientist as a fieldable policy: picks the experiment whose worst case leaves the fewest chemistries standing, publishes only ingredients its grid has SOLVED, and attacks a rival's seal only with a reagent whose demonstration must expose it. The game server plays it deterministically, no LLM involved. Prompt policies reuse the same image with /bin/cogchemists-player and PLAYER_PROMPT.",
       "image": "{{COGCHEMISTS_IMAGE}}",
       "run": [
         "/bin/cogchemists-player"
@@ -470,13 +483,13 @@
     },
     "players": [
       {
+        "player_id": "cogchemists-player"
+      },
+      {
         "player_id": "cogchemists-assayer"
       },
       {
         "player_id": "cogchemists-quack"
-      },
-      {
-        "player_id": "cogchemists-assayer"
       },
       {
         "player_id": "cogchemists-quack"
