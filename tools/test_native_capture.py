@@ -17,7 +17,7 @@ from pathlib import Path
 
 class Provider(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    fail_round_2 = False
+    fail_mode = None  # None | "malformed" | "transport"
 
     def log_message(self, *args):
         pass
@@ -34,8 +34,17 @@ class Provider(BaseHTTPRequestHandler):
         for other in range(4):
             if str(other) != slot:
                 assert "PRIVATE_OPERATOR_" + str(other) not in user
+        if phase == "LAB" and round_number == 2 and self.fail_mode == "transport":
+            err_body = json.dumps({"error": "upstream unavailable"}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.send_header("X-Softmax-Llm-Call-Id", str(uuid.uuid5(uuid.NAMESPACE_URL, raw.decode())))
+            self.end_headers()
+            self.wfile.write(err_body)
+            return
         retry = "Your previous reply was rejected" in user
-        if phase == "LAB" and ((self.fail_round_2 and round_number == 2) or (round_number == 1 and not retry)):
+        if phase == "LAB" and ((self.fail_mode == "malformed" and round_number == 2) or (round_number == 1 and not retry)):
             text = "invalid fixture reply"
         else:
             action = {"action": "forage" if phase == "LAB" else "pass", "say": "", "notes": "PRIVATE_CAPTURE_" + slot}
@@ -62,8 +71,8 @@ class Provider(BaseHTTPRequestHandler):
         self.wfile.write(response)
 
 
-def run(game, player, output, variant, capture, fail_round_2=False):
-    suffix = f"{variant['id']}-capture{capture}" + ("-fail" if fail_round_2 else "")
+def run(game, player, output, variant, capture, fail_mode=None):
+    suffix = f"{variant['id']}-capture{capture}" + (f"-fail-{fail_mode}" if fail_mode else "")
     root = output / suffix
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
@@ -110,7 +119,7 @@ def run(game, player, output, variant, capture, fail_round_2=False):
     class CaseProvider(Provider):
         pass
 
-    CaseProvider.fail_round_2 = fail_round_2
+    CaseProvider.fail_mode = fail_mode
     provider = ThreadingHTTPServer(("127.0.0.1", 0), CaseProvider)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
@@ -142,20 +151,30 @@ def run(game, player, output, variant, capture, fail_round_2=False):
         rc = server.wait(timeout=120)
         for child in children[1:]:
             assert child.wait(timeout=5) == 0
-        results = json.loads((root / "results.json").read_text())
-        replay = json.loads((root / "replay.json").read_text())
-        if fail_round_2:
+        if fail_mode is not None:
             assert rc != 0
-            assert results["reason"] == "player_failure"
+            assert not (root / "results.json").exists(), "failed run must not write results.json"
+            assert not (root / "replay.json").exists(), "failed run must not write replay.json"
+            for seat in range(seats):
+                player_log = (root / f"player-{seat}.log").read_text()
+                assert "final scores" not in player_log, "failed run must not send final.scores"
             failure = json.loads((root / "player_failure.json").read_text())
-            assert failure["reason"] == "player_failure"
+            expected_kind = "transport_failure" if fail_mode == "transport" else "malformed_player_data"
+            assert failure["failure_kind"] == expected_kind
+            assert failure["reason"] == expected_kind
             assert len(failure["failures"]) == seats
             for entry in failure["failures"]:
-                assert entry["raw_response"] == "invalid fixture reply"
+                assert entry["failure_kind"] == expected_kind
+                if fail_mode == "malformed":
+                    assert entry["raw_response"] == "invalid fixture reply"
+                else:
+                    assert "upstream unavailable" in entry["raw_response"]
             if capture:
                 trace = root / "trajectory.jsonl"
                 rows = [json.loads(line) for line in trace.read_text().splitlines()]
                 assert rows[-1]["status"] == "failed"
+                assert rows[-1]["participant_outcomes"] == {}
+                assert rows[-1]["outcome"]["failure_kind"] == expected_kind
                 failed_rows = [r for r in rows[:-1] if r["terminal"]]
                 assert len(failed_rows) == seats
                 for row in failed_rows:
@@ -163,8 +182,13 @@ def run(game, player, output, variant, capture, fail_round_2=False):
                     assert row["executed_action"] is None
                     assert row["selected_attempt_id"] is None
                     assert len(row["attempts"]) == 2
-                    assert all(a["response"] == "invalid fixture reply" for a in row["attempts"])
-            return results, replay
+                    if fail_mode == "malformed":
+                        assert all(a["response"] == "invalid fixture reply" for a in row["attempts"])
+                    else:
+                        assert all("upstream unavailable" in a["raw_response"] for a in row["attempts"])
+            return None, None
+        results = json.loads((root / "results.json").read_text())
+        replay = json.loads((root / "replay.json").read_text())
         assert rc == 0
         assert not (root / "player_failure.json").exists()
         assert results["reason"] == "complete"
@@ -228,10 +252,11 @@ def main():
         captured = run(game, player, destination, variant, True)
         ordinary = run(game, player, destination, variant, False)
         assert captured == ordinary, "capture changed the native outcome or replay"
-    run(game, player, destination, manifest["variants"][0], True, fail_round_2=True)
+    run(game, player, destination, manifest["variants"][0], True, fail_mode="malformed")
+    run(game, player, destination, manifest["variants"][0], True, fail_mode="transport")
     print(
-        "five native games: capture parity, initiative-conflict exclusion, retries, explicit failure "
-        "(no fallback), normalization, privacy and missing usage pass"
+        "six native games: capture parity, initiative-conflict exclusion, retries, unscored malformed "
+        "and transport failure (no results.json/replay.json/fallback), normalization, privacy and missing usage pass"
     )
 
 

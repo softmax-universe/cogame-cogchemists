@@ -125,10 +125,12 @@ proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   let outcome = game.resultsJson()
   var scores = newJObject()
   for seat in 0 ..< Seats: scores[$seat] = outcome["scores"][seat]
-  let reason = outcome["reason"].getStr()
-  let status =
-    if reason == "complete": esCompleted
-    elif reason == "player_failure": esFailed
-    else: esTruncated
-  trajectory.finish(status, outcome, scores)
+  trajectory.finish(if outcome["reason"].getStr() == "complete": esCompleted else: esTruncated,
+    outcome, scores)
+  trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc failNativeTrajectory*(trajectory: DecisionTrajectory, failurePayload: JsonNode) =
+  ## Terminates the trajectory unscored on explicit model/transport failure.
+  if trajectory.isNil: return
+  trajectory.finish(esFailed, failurePayload, newJObject())
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))

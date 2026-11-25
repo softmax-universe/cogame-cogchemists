@@ -32,15 +32,26 @@ const
   MaxSignatureLen* = 12
 
 type
+  LlmTransportError* = object of CogchemistsError
+  MalformedReplyError* = object of CogchemistsError
+
   ScriptKind* = enum
     skNone = "none"
     skAssayer = "assayer"
     skQuack = "quack"
 
+  FailureKind* = enum
+    fkNone = ""
+    fkMissingCredentials = "missing_credentials"
+    fkTransportFailure = "transport_failure"
+    fkMalformedPlayerData = "malformed_player_data"
+    fkExternalTimeout = "external_timeout"
+
   DecisionOutcome* = object
     ok*: bool
     action*: Action
     fromScript*: bool
+    failureKind*: FailureKind
     error*: string
     rawReply*: string
 
@@ -328,7 +339,7 @@ proc optionalStringField(payload: JsonNode, key: string): string =
   if not payload.hasKey(key) or payload[key].kind == JNull:
     return ""
   if payload[key].kind != JString:
-    raise newException(CogchemistsError,
+    raise newException(MalformedReplyError,
       "\"" & key & "\" must be a string")
   payload[key].getStr()
 
@@ -340,10 +351,10 @@ proc actionReply*(action: Action): JsonNode =
     "artifact": action.artifact, "say": action.say, "notes": action.notes}
 
 proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Action =
-  ## Turns one model reply into an Action. Raises CogchemistsError on
+  ## Turns one model reply into an Action. Raises MalformedReplyError on
   ## anything outside the strict canonical schema.
   if payload.isNil or payload.kind != JObject:
-    raise newException(CogchemistsError, "response must be a JSON object")
+    raise newException(MalformedReplyError, "response must be a JSON object")
   result.a = -1
   result.b = -1
   result.signature = -1
@@ -351,13 +362,13 @@ proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Action =
   result.say = cleanText(optionalStringField(payload, "say"), MaxSayLen)
     .replace("\n", " ").replace("\r", " ")
   if not payload.hasKey("action") or payload["action"].kind != JString:
-    raise newException(CogchemistsError, "no action in response")
+    raise newException(MalformedReplyError, "no action in response")
   let verb = payload["action"].getStr().strip()
   if verb.len == 0:
-    raise newException(CogchemistsError, "no action in response")
+    raise newException(MalformedReplyError, "no action in response")
   let menu = if sim.phase == phLab: @LabActions else: @MarketActions
   if verb notin menu:
-    raise newException(CogchemistsError,
+    raise newException(MalformedReplyError,
       "\"" & verb & "\" is not a " & $sim.phase & " action")
   result.action = verb
   let aText = optionalStringField(payload, "a").strip()
@@ -366,23 +377,23 @@ proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Action =
       "endorse", "debunk"]:
     result.a = resolveIngredient(aText)
     if result.a < 0:
-      raise newException(CogchemistsError,
+      raise newException(MalformedReplyError,
         "\"" & aText & "\" is not one of the eight exact ingredient names")
   if verb in ["test_student", "test_self", "sell", "debunk"]:
     result.b = resolveIngredient(bText)
     if result.b < 0:
-      raise newException(CogchemistsError,
+      raise newException(MalformedReplyError,
         "\"" & bText & "\" is not one of the eight exact ingredient names")
   if verb == "publish":
     let sigText = optionalStringField(payload, "signature").strip()
     result.signature = parseSignature(sigText)
     if result.signature < 0:
-      raise newException(CogchemistsError,
+      raise newException(MalformedReplyError,
         "signature must be exact RGB notation like R+G-B+")
   if verb == "buy":
     result.artifact = optionalStringField(payload, "artifact").strip()
     if result.artifact notin ["mortar", "press"]:
-      raise newException(CogchemistsError,
+      raise newException(MalformedReplyError,
         "artifact must be exact \"mortar\" or \"press\"")
 
 # ---- Prompt building --------------------------------------------------------
@@ -656,30 +667,30 @@ proc extractJsonObject*(text: string): JsonNode =
   if body.startsWith("```"):
     let nl = body.find('\n')
     if nl < 0:
-      raise newException(CogchemistsError, "malformed markdown fence in response: " &
+      raise newException(MalformedReplyError, "malformed markdown fence in response: " &
         cleanText(text, 160).replace("\n", " "))
     let header = body[3 ..< nl].strip().toLowerAscii()
     if header.len > 0 and header != "json":
-      raise newException(CogchemistsError, "unsupported markdown fence in response: " &
+      raise newException(MalformedReplyError, "unsupported markdown fence in response: " &
         cleanText(text, 160).replace("\n", " "))
     if not body.endsWith("```"):
-      raise newException(CogchemistsError, "unterminated markdown fence in response: " &
+      raise newException(MalformedReplyError, "unterminated markdown fence in response: " &
         cleanText(text, 160).replace("\n", " "))
     let closing = body.len - 3
     if closing <= nl + 1:
-      raise newException(CogchemistsError, "empty markdown fence in response: " &
+      raise newException(MalformedReplyError, "empty markdown fence in response: " &
         cleanText(text, 160).replace("\n", " "))
     body = body[nl + 1 ..< closing].strip()
   if not (body.startsWith("{") and body.endsWith("}")):
-    raise newException(CogchemistsError, "response must be a JSON object: " &
+    raise newException(MalformedReplyError, "response must be a JSON object: " &
       cleanText(text, 160).replace("\n", " "))
   try:
     result = parseJson(body)
   except JsonParsingError as error:
-    raise newException(CogchemistsError, "invalid JSON in response (" & error.msg & "): " &
+    raise newException(MalformedReplyError, "invalid JSON in response (" & error.msg & "): " &
       cleanText(text, 160).replace("\n", " "))
   if result.kind != JObject:
-    raise newException(CogchemistsError, "JSON response must be an object: " &
+    raise newException(MalformedReplyError, "JSON response must be an object: " &
       cleanText(text, 160).replace("\n", " "))
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
@@ -716,35 +727,40 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a CogchemistsError describing why
-  ## there is none. Auth failures disable the client; model-access and
-  ## throttle failures rotate the Bedrock model for the next batch.
+  ## The text of one batched reply, or a typed error distinguishing transport
+  ## failures (LlmTransportError) from model output failures (MalformedReplyError).
   if error.len > 0:
-    raise newException(CogchemistsError, "llm transport: " & error)
+    raise newException(LlmTransportError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = cleanText(response.body, 400)
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(CogchemistsError,
+      raise newException(LlmTransportError,
         "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(CogchemistsError,
+    raise newException(LlmTransportError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = cleanText(response.body, 300)
     discard client.tryNextBedrockModel("throttled")
-    raise newException(CogchemistsError, "llm throttled (429): " & detail)
+    raise newException(LlmTransportError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(CogchemistsError, "anthropic error " & $response.code &
+    raise newException(LlmTransportError, "anthropic error " & $response.code &
       ": " & cleanText(response.body, 300))
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except JsonParsingError as parseErr:
+    raise newException(LlmTransportError, "invalid provider response JSON: " & parseErr.msg)
+  if payload.kind != JObject or not payload.hasKey("content") or payload["content"].kind != JArray:
+    raise newException(LlmTransportError, "provider response missing content array")
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(CogchemistsError, "anthropic refusal")
+    raise newException(MalformedReplyError, "anthropic refusal")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(CogchemistsError, "reply cut off at max_tokens " &
+    raise newException(MalformedReplyError, "reply cut off at max_tokens " &
       "before any JSON: " & cleanText(result, 160).replace("\n", " "))
 
 proc awaitBatchSlot(client: LlmClient) =
@@ -776,6 +792,7 @@ proc decideAll*(
   var open: seq[int]     ## indexes into `seats` still undecided
   var lastError = newSeq[string](seats.len)
   var lastRaw = newSeq[string](seats.len)
+  var lastKind = newSeq[FailureKind](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
     if kind != skNone:
@@ -788,6 +805,7 @@ proc decideAll*(
       result[index] = DecisionOutcome(
         ok: false,
         fromScript: false,
+        failureKind: fkMissingCredentials,
         error: "no LLM credentials configured for prompt seat"
       )
     else:
@@ -799,6 +817,8 @@ proc decideAll*(
       for index in open:
         if lastError[index].len == 0:
           lastError[index] = "LLM client disabled after auth failure"
+        if lastKind[index] == fkNone:
+          lastKind[index] = fkTransportFailure
       break
     var batch: RequestBatch
     var pendingEvidence: seq[DecisionAttempt]
@@ -850,10 +870,19 @@ proc decideAll*(
           fromScript: false,
           rawReply: text
         )
+      except LlmTransportError as error:
+        if capture: evidence.rejectionReason = some(error.msg)
+        lastError[index] = error.msg
+        lastRaw[index] = rawText
+        lastKind[index] = fkTransportFailure
+        echo "cogchemists llm: seat ", seat, " attempt ", attempt,
+          " transport failed: ", error.msg
+        stillOpen.add(index)
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
         lastError[index] = error.msg
         lastRaw[index] = rawText
+        lastKind[index] = fkMalformedPlayerData
         echo "cogchemists llm: seat ", seat, " attempt ", attempt,
           " failed: ", error.msg
         stillOpen.add(index)
@@ -861,10 +890,12 @@ proc decideAll*(
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "cogchemists llm: seat ", seat, " failed explicitly: ", lastError[index]
+    let kind = if lastKind[index] != fkNone: lastKind[index] else: fkMalformedPlayerData
+    echo "cogchemists llm: seat ", seat, " failed explicitly (", $kind, "): ", lastError[index]
     result[index] = DecisionOutcome(
       ok: false,
       fromScript: false,
+      failureKind: kind,
       error: (if lastError[index].len > 0: lastError[index] else: "model decision failed"),
       rawReply: lastRaw[index]
     )
