@@ -53,9 +53,12 @@ coworld upload-policy coworld-cogchemists:latest \
 `PLAYER_SCRIPTED=assayer` fields the built-in competent scientist instead (picks the experiment
 whose worst case leaves the fewest chemistries standing, publishes only what it has solved, attacks
 only with a reagent that must expose the claim); `PLAYER_SCRIPTED=quack` fields the reckless
-careerist. Offline certification and the docker smoke explicitly select these baseline policies so
-they complete without a network call; prompt seats require LLM credentials and fail explicitly on
-missing credentials or invalid replies rather than substituting a scripted fallback.
+careerist. Prompt seats (`cogchemists-player`, `PLAYER_PROMPT`) send their strategy prompt to the
+game container (`/bin/cogchemists`), which owns the LLM HTTP calls to `COWORLD_LLM_ENDPOINT`, and
+abort unscored (no `results.json`) on missing credentials, transport failure, or malformed replies
+rather than substituting a scripted fallback. Certification seats `cogchemists-player`
+(`COWORLD_LLM_ENABLED=true`) against explicit `cogchemists-assayer` and `cogchemists-quack`
+opponents.
 
 For real-model posttraining, enable the private native decision trajectory with
 `COGAME_SAVE_TRAJECTORY_URI`. It preserves the actual parallel requests, retries,

@@ -38,9 +38,14 @@
 #                              job loads it in a real browser -- that is the
 #                              only replay in CI that is known to be readable
 #                              by this game's own viewer.
-#   ANTHROPIC_API_KEY          if set, forwarded to the game; the certification
-#                              fixture explicitly selects baseline policies so
-#                              offline smoke completes without LLM credentials
+#   ANTHROPIC_API_KEY          if set, forwarded to the game; if neither
+#                              COWORLD_LLM_ENDPOINT nor ANTHROPIC_API_KEY is
+#                              set, docker_smoke starts a local deterministic
+#                              HTTP fixture on the host and forwards
+#                              COWORLD_LLM_ENDPOINT to the game container so
+#                              slot 0 (cogchemists-player) executes real
+#                              deterministic HTTP learner turns without paid
+#                              provider calls
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,8 +70,13 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+fixture_pid=""
 
 cleanup() {
+  if [ -n "${fixture_pid}" ]; then
+    kill "${fixture_pid}" >/dev/null 2>&1 || true
+    wait "${fixture_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +201,49 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+game_host_args=()
+used_local_fixture=0
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  game_host_args+=(--add-host=host.docker.internal:host-gateway)
+  echo "COWORLD_LLM_ENDPOINT present: forwarded to game"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: forwarded to game"
 else
-  echo "no ANTHROPIC_API_KEY: certification explicitly selects scripted baseline policies"
+  python3 "${script_dir}/llm_fixture.py" \
+    --host 0.0.0.0 \
+    --port 0 \
+    --port-file "${work_dir}/llm_fixture.port" \
+    --count-file "${work_dir}/llm_fixture.count" \
+    >"${work_dir}/llm_fixture.log" 2>&1 &
+  fixture_pid="$!"
+  for _ in $(seq 1 50); do
+    if [ -s "${work_dir}/llm_fixture.port" ]; then break; fi
+    sleep 0.1
+  done
+  test -s "${work_dir}/llm_fixture.port" || {
+    echo "FAIL: local LLM fixture did not start" >&2
+    cat "${work_dir}/llm_fixture.log" >&2 || true
+    exit 1
+  }
+  fixture_port="$(cat "${work_dir}/llm_fixture.port")"
+  game_host_args+=(--add-host=host.docker.internal:host-gateway)
+  game_env+=(
+    -e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${fixture_port}"
+    -e "COWORLD_LLM_MODEL=docker-smoke-fixture"
+  )
+  used_local_fixture=1
+  echo "no external LLM endpoint: started local deterministic fixture on port ${fixture_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  ${game_host_args[@]+"${game_host_args[@]}"} \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -335,6 +378,16 @@ PY
 then
   dump_logs
   exit 1
+fi
+
+if [ "${used_local_fixture}" = "1" ]; then
+  fixture_count="$(cat "${work_dir}/llm_fixture.count" 2>/dev/null || echo 0)"
+  echo "local deterministic LLM fixture served ${fixture_count} learner HTTP requests"
+  if [ "${fixture_count}" -lt 1 ]; then
+    echo "FAIL: expected at least 1 learner HTTP request to local LLM fixture, got ${fixture_count}" >&2
+    dump_logs
+    exit 1
+  fi
 fi
 
 # --------------------------------------------------------------------------
