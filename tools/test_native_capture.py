@@ -160,21 +160,25 @@ def run(game, player, output, variant, capture, fail_mode=None):
                 assert "final scores" not in player_log, "failed run must not send final.scores"
             failure = json.loads((root / "player_failure.json").read_text())
             expected_kind = "transport_failure" if fail_mode == "transport" else "malformed_player_data"
-            assert failure["failure_kind"] == expected_kind
-            assert failure["reason"] == expected_kind
-            assert len(failure["failures"]) == seats
-            for entry in failure["failures"]:
-                assert entry["failure_kind"] == expected_kind
-                if fail_mode == "malformed":
-                    assert entry["raw_response"] == "invalid fixture reply"
-                else:
-                    assert "upstream unavailable" in entry["raw_response"]
+            assert set(failure) == {"kind", "failed_policy_index", "message"}
+            assert failure["kind"] == ("episode_inconclusive" if fail_mode == "transport" else "player_error")
+            assert failure["failed_policy_index"] in range(seats)
+            assert failure["message"] == expected_kind
             if capture:
                 trace = root / "trajectory.jsonl"
                 rows = [json.loads(line) for line in trace.read_text().splitlines()]
                 assert rows[-1]["status"] == "failed"
                 assert rows[-1]["participant_outcomes"] == {}
                 assert rows[-1]["outcome"]["failure_kind"] == expected_kind
+                assert rows[-1]["outcome"]["failure_kind"] == expected_kind
+                assert rows[-1]["outcome"]["reason"] == expected_kind
+                assert len(rows[-1]["outcome"]["failures"]) == seats
+                for entry in rows[-1]["outcome"]["failures"]:
+                    assert entry["failure_kind"] == expected_kind
+                    if fail_mode == "malformed":
+                        assert entry["raw_response"] == "invalid fixture reply"
+                    else:
+                        assert "upstream unavailable" in entry["raw_response"]
                 failed_rows = [r for r in rows[:-1] if r["terminal"]]
                 assert len(failed_rows) == seats
                 for row in failed_rows:

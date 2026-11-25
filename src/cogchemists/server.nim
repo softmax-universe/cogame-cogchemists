@@ -226,7 +226,8 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "cogchemists: episode complete, shutting down"
   quit(0)
 
-proc abortEpisodeWithFailure(runtimeConfig: RuntimeConfig, failurePayload: JsonNode) =
+proc abortEpisodeWithFailure(runtimeConfig: RuntimeConfig, failurePayload: JsonNode,
+    kind: FailureKind, seat: int) =
   ## Unscored explicit termination on exhausted model or transport failure.
   ## Never settles the sim, never sends final.scores, and never writes
   ## resultsUri or replayUri; emits only raw failure evidence and exits 1.
@@ -252,7 +253,11 @@ proc abortEpisodeWithFailure(runtimeConfig: RuntimeConfig, failurePayload: JsonN
   if failureUri.len > 0:
     echo "cogchemists: writing player failure artifact"
     writeArtifact(
-      failureUri, $failurePayload, "application/json",
+      failureUri, $(%*{
+        "kind": (if kind == fkMalformedPlayerData: "player_error" else: "episode_inconclusive"),
+        "failed_policy_index": seat,
+        "message": $kind
+      }), "application/json",
       "COGAME_PLAYER_FAILURE_METHOD"
     )
   echo "cogchemists: episode aborted unscored (", failurePayload["failure_kind"].getStr(), ")"
@@ -428,6 +433,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
       var failureList = newJArray()
       var primaryKind = fkNone
+      var primarySeat = -1
       for index, seat in seats:
         if not outcomes[index].ok:
           let kind =
@@ -435,6 +441,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             else: fkMalformedPlayerData
           if primaryKind == fkNone or kind == fkTransportFailure:
             primaryKind = kind
+            primarySeat = seat
           failureList.add(%*{
             "slot": seat,
             "name": config.players[seat].name,
@@ -461,7 +468,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               state.trajectory.recordFailedDecision(config, state.selection,
                 simCopy.round * 2 + ord(simCopy.phase), seat, privateViews[index],
                 outcomes[index].error, outcomes[index].rawReply, attempts)
-        abortEpisodeWithFailure(runtimeConfig, failurePayload)
+        abortEpisodeWithFailure(runtimeConfig, failurePayload, primaryKind, primarySeat)
         return
 
       withLock stateLock:
